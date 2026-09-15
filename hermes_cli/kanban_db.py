@@ -3544,6 +3544,7 @@ def archive_task(
     *,
     signal_fn=None,
     expected_statuses: Optional[set[str]] = None,
+    reason: Optional[str] = None,
 ) -> bool:
     """Archive a task; a *running* task's host-local worker is terminated.
 
@@ -3595,7 +3596,13 @@ def archive_task(
             conn, task_id, outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        _append_event(
+            conn,
+            task_id,
+            "archived",
+            {"reason": reason} if reason else None,
+            run_id=run_id,
+        )
     if was_running:
         termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn)
         with write_txn(conn):

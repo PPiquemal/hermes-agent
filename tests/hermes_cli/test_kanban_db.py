@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -1790,7 +1791,19 @@ def test_archive_task_accepts_status_inside_expected_set(kanban_home):
         current = kb.get_task(conn, task_id)
         assert current is not None
 
-        assert kb.archive_task(conn, task_id, expected_statuses={current.status}) is True
+        assert kb.archive_task(
+            conn,
+            task_id,
+            expected_statuses={current.status},
+            reason="Cancelled by the operator after scope changed.",
+        ) is True
         archived = kb.get_task(conn, task_id)
         assert archived is not None
         assert archived.status == "archived"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archived'",
+            (task_id,),
+        ).fetchone()
+        assert json.loads(event["payload"])["reason"] == (
+            "Cancelled by the operator after scope changed."
+        )
