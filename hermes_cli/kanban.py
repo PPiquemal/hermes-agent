@@ -1044,10 +1044,11 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
     expected_statuses = getattr(args, "expected_statuses", None)
+    reason = getattr(args, "reason", None)
     if ids and purge_ids:
         return _err("choose either task_ids to archive or --rm archived task_ids")
-    if purge_ids and expected_statuses:
-        return _err("--expected-status cannot be used with --rm")
+    if purge_ids and (expected_statuses or reason is not None):
+        return _err("--expected-status and --reason cannot be used with --rm")
     if not ids and not purge_ids:
         return _err("at least one task_id is required")
     with kbc.connect_closing() as conn:
@@ -1056,6 +1057,7 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                                lambda tid: f"cannot delete {tid} (must already be archived)")
         return _bulk_apply(ids, lambda tid: kb.archive_task(
             conn, tid, expected_statuses=set(expected_statuses) if expected_statuses else None,
+            reason=reason,
         ),
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
 
