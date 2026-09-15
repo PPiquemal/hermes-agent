@@ -91,6 +91,56 @@ def test_archive_expected_status_refuses_stale_task_state(kanban_home, capsys):
         assert kb.get_task(conn, task_id).status == "done"
 
 
+def test_archive_reason_is_recorded_atomically_with_expected_status(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="cancelled operation")
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    args = parser.parse_args(
+        [
+            "kanban",
+            "archive",
+            task_id,
+            "--expected-status",
+            current.status,
+            "--reason",
+            "Cancelled after operator review",
+        ]
+    )
+
+    assert kc.kanban_command(args) == 0
+    with kbc.connect_closing() as conn:
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'archived'",
+            (task_id,),
+        ).fetchone()
+        assert json.loads(event["payload"])["reason"] == (
+            "Cancelled after operator review"
+        )
+
+
+def test_archive_rm_rejects_explicitly_empty_reason(kanban_home, capsys):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="retained archive")
+        assert kb.archive_task(conn, task_id)
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    args = parser.parse_args(
+        ["kanban", "archive", "--rm", task_id, "--reason", ""]
+    )
+
+    assert kc.kanban_command(args) == 1
+    assert "cannot be used with --rm" in capsys.readouterr().err
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, task_id) is not None
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")

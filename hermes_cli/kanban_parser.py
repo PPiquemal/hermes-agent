@@ -341,6 +341,7 @@ _SPECS = [
             choices=sorted(kb.VALID_STATUSES - {"archived"}),
             help="Archive only when the current status is one of these values",
         ),
+        _arg("--reason", help="Audit reason stored atomically with the archive event"),
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
     ], help="Archive one or more tasks"),
