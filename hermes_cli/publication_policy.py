@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -268,8 +269,9 @@ class PushPlan:
     branch: str
     sha: str
     base: str
+    expected_remote_sha: str | None = None
 
-    def argv(self, gh_path: str | None = None) -> list[str]:
+    def argv(self, gh_path: str | None = None, hooks_path: str | None = None) -> list[str]:
         credential_args: list[str] = []
         if gh_path is not None:
             helper = f"!{shlex.quote(gh_path)} auth git-credential"
@@ -277,8 +279,10 @@ class PushPlan:
                 "-c", "credential.helper=",
                 "-c", f"credential.helper={helper}",
             ]
+        hooks_args = ["-c", f"core.hooksPath={hooks_path}"] if hooks_path else []
         return [
             *credential_args,
+            *hooks_args,
             "-c", "push.followTags=false",
             "-c", "push.recurseSubmodules=no",
             "-c", "http.followRedirects=false",
@@ -571,6 +575,100 @@ def _remote_branch_sha(
     return target["sha"]
 
 
+def _verify_local_fast_forward(
+    git: Callable[[list[str]], tuple[int, str, str]],
+    expected_sha: str,
+    new_sha: str,
+) -> None:
+    if not re.fullmatch(r"[0-9a-f]{40}", str(expected_sha or "")):
+        raise blocked("LOCAL_EXPECTED_SHA_MISSING: expected remote SHA must be exact")
+    if not re.fullmatch(r"[0-9a-f]{40}", str(new_sha or "")):
+        raise blocked("LOCAL_NEW_SHA_MISSING: new local SHA must be exact")
+    if expected_sha == new_sha:
+        raise blocked("LOCAL_FAST_FORWARD_REQUIRED: update SHAs must be distinct")
+    for sha, reason in (
+        (expected_sha, "LOCAL_EXPECTED_SHA_MISSING"),
+        (new_sha, "LOCAL_NEW_SHA_MISSING"),
+    ):
+        try:
+            code, out, _ = git(["rev-parse", "--verify", f"{sha}^{{commit}}"])
+        except (OSError, TypeError, ValueError) as exc:
+            raise blocked(f"{reason}: local commit lookup failed") from exc
+        if code or out.strip() != sha:
+            raise blocked(f"{reason}: exact local commit is unavailable")
+    try:
+        code, _, _ = git(["merge-base", "--is-ancestor", expected_sha, new_sha])
+    except (OSError, TypeError, ValueError) as exc:
+        raise blocked("LOCAL_FAST_FORWARD_UNVERIFIABLE: ancestry check failed") from exc
+    if code == 1:
+        raise blocked("LOCAL_FAST_FORWARD_REQUIRED: new SHA diverges from expected remote SHA")
+    if code:
+        raise blocked("LOCAL_FAST_FORWARD_UNVERIFIABLE: ancestry check failed")
+
+
+def _verify_new_sha_on_branch(
+    git: Callable[[list[str]], tuple[int, str, str]],
+    branch: str,
+    new_sha: str,
+) -> None:
+    if not _valid_branch(branch):
+        raise blocked("LOCAL_NEW_SHA_UNREACHABLE: destination branch is invalid")
+    try:
+        code, out, _ = git(["symbolic-ref", "--quiet", "--short", "HEAD"])
+    except (OSError, TypeError, ValueError) as exc:
+        raise blocked("LOCAL_NEW_SHA_UNREACHABLE: checked-out branch lookup failed") from exc
+    if code or out.strip() != branch:
+        raise blocked("LOCAL_NEW_SHA_UNREACHABLE: destination branch is not checked out")
+    try:
+        code, out, _ = git(["rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}"])
+    except (OSError, TypeError, ValueError) as exc:
+        raise blocked("LOCAL_NEW_SHA_UNREACHABLE: branch lookup failed") from exc
+    branch_head = out.strip()
+    if code or not re.fullmatch(r"[0-9a-f]{40}", branch_head):
+        raise blocked("LOCAL_NEW_SHA_UNREACHABLE: destination branch is unavailable")
+    try:
+        code, _, _ = git(["merge-base", "--is-ancestor", new_sha, branch_head])
+    except (OSError, TypeError, ValueError) as exc:
+        raise blocked("LOCAL_NEW_SHA_UNREACHABLE: branch ancestry check failed") from exc
+    if code:
+        raise blocked("LOCAL_NEW_SHA_UNREACHABLE: new SHA is not on the destination branch")
+
+
+def _install_expected_remote_hook(hooks_path: str, branch: str, expected_sha: str) -> str:
+    if not os.path.isabs(hooks_path) or not _valid_branch(branch):
+        raise blocked("REMOTE_COMPARE_AND_SWAP_UNAVAILABLE: hook target is invalid")
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
+        raise blocked("REMOTE_COMPARE_AND_SWAP_UNAVAILABLE: expected SHA is invalid")
+    hook = Path(hooks_path) / "pre-push"
+    target_ref = f"refs/heads/{branch}"
+    script = f"""#!/bin/sh
+expected='{expected_sha}'
+target='{target_ref}'
+seen=0
+while IFS=' ' read -r local_ref local_oid remote_ref remote_oid
+do
+    if [ "$remote_ref" = "$target" ]; then
+        seen=$((seen + 1))
+        if [ "$remote_oid" != "$expected" ]; then
+            echo 'BLOCKED: remote ref moved before checked push' >&2
+            exit 42
+        fi
+    fi
+done
+if [ "$seen" -ne 1 ]; then
+    echo 'BLOCKED: checked destination ref was not advertised exactly once' >&2
+    exit 43
+fi
+exit 0
+"""
+    try:
+        hook.write_text(script, encoding="utf-8")
+        hook.chmod(0o700)
+    except OSError as exc:
+        raise blocked("REMOTE_COMPARE_AND_SWAP_UNAVAILABLE: cannot install pre-push check") from exc
+    return str(hook)
+
+
 def execute_checked_push(
     git: Callable[[list[str]], tuple[int, str, str]],
     gh: Callable[[list[str]], tuple[int, str, str]],
@@ -580,14 +678,34 @@ def execute_checked_push(
     credential_check: Callable[[str], None] = validate_gh_credential,
 ) -> dict:
     """Execute one authenticated checked push and verify its exact remote ref."""
+    if plan.repository != "PPiquemal/hermes-agent" or plan.operation != "checked_branch_push":
+        raise blocked("CHECKED_PUSH_NOT_AUTHORIZED: executor is restricted to the Hermes checked push")
+    if plan.base != "main" or plan.branch == plan.base or not _valid_branch(plan.branch):
+        raise blocked("CHECKED_PUSH_NOT_AUTHORIZED: branch or base is outside policy")
     gh_path = validate_gh_executable_path(gh_path)
     expected_url = f"https://github.com/{plan.repository}.git"
     if plan.url != expected_url:
         raise blocked("CHECKED_HTTPS_REQUIRED: push URL is not the exact authorized HTTPS destination")
+    if plan.expected_remote_sha is not None:
+        _verify_local_fast_forward(git, plan.expected_remote_sha, plan.sha)
+        _verify_new_sha_on_branch(git, plan.branch, plan.sha)
     _preflight_push_identity_and_permission(gh, plan.repository)
     credential_check(gh_path)
     before = _remote_branch_sha(gh, plan, stage="preflight")
-    if before is not None:
+    if plan.expected_remote_sha is not None:
+        if before is None:
+            raise blocked("REMOTE_EXPECTED_SHA_MISSING: authorized remote ref does not exist")
+        if before != plan.expected_remote_sha:
+            raise blocked(
+                f"REMOTE_REF_MOVED: expected={plan.expected_remote_sha} observed={before}"
+            )
+        immediately_before = _remote_branch_sha(gh, plan, stage="prepush")
+        if immediately_before != plan.expected_remote_sha:
+            observed = immediately_before or "absent"
+            raise blocked(
+                f"REMOTE_REF_MOVED: expected={plan.expected_remote_sha} observed={observed}"
+            )
+    elif before is not None:
         if before != plan.sha:
             raise blocked(
                 f"REMOTE_REF_CONFLICT: refs/heads/{plan.branch} points to {before}, not {plan.sha}"
@@ -601,7 +719,12 @@ def execute_checked_push(
             "write_performed": False,
             "readback_verified": True,
         }
-    code, _, err = git(plan.argv(gh_path))
+    if plan.expected_remote_sha is not None:
+        with tempfile.TemporaryDirectory(prefix="hermes-checked-push-") as hooks_path:
+            _install_expected_remote_hook(hooks_path, plan.branch, plan.expected_remote_sha)
+            code, _, err = git(plan.argv(gh_path, hooks_path))
+    else:
+        code, _, err = git(plan.argv(gh_path))
     if code:
         evidence = sanitize_publication_evidence(err)
         raise blocked(
@@ -613,7 +736,7 @@ def execute_checked_push(
         raise blocked(
             f"REMOTE_REF_READBACK_MISMATCH: expected={plan.sha} observed={observed}"
         )
-    return {
+    receipt = {
         "repository": plan.repository,
         "ref": f"refs/heads/{plan.branch}",
         "sha": plan.sha,
@@ -622,6 +745,15 @@ def execute_checked_push(
         "write_performed": True,
         "readback_verified": True,
     }
+    if plan.expected_remote_sha is not None:
+        receipt.update({
+            "expected_remote_sha": plan.expected_remote_sha,
+            "remote_readback_sha": after,
+            "git_push_exit_status": 0,
+            "remote_compare_and_swap_verified": True,
+            "result": "fast_forward_updated",
+        })
+    return receipt
 
 
 def _preflight_repository_and_workflow(
@@ -946,6 +1078,8 @@ def resolve_push_plan(
     remote: str | None = None,
     branch: str | None = None,
     destination_branch: str | None = None,
+    expected_remote_sha: str | None = None,
+    new_sha: str | None = None,
     ssh_config: Callable[[str], dict[str, str]] | None = None,
 ) -> PushPlan:
     config = repository_policy(repository, operation)
@@ -987,10 +1121,27 @@ def resolve_push_plan(
             raise blocked("update publication is restricted to verified main-to-main synchronization")
     elif destination_branch == config["base"]:
         raise blocked("direct publication to the protected base branch is not authorized")
-    sha = read(["rev-parse", "--verify", f"refs/heads/{source_branch}^{{commit}}"])
-    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+    branch_head = read(["rev-parse", "--verify", f"refs/heads/{source_branch}^{{commit}}"])
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", branch_head):
         raise blocked("cannot verify publication commit")
-    return PushPlan(repository, operation, url, destination_branch, sha, config["base"])
+    if (expected_remote_sha is None) != (new_sha is None):
+        raise blocked("checked fast-forward update requires both expected and new exact SHAs")
+    if expected_remote_sha is not None:
+        if new_sha is None:
+            raise blocked("checked fast-forward update requires a new exact SHA")
+        if repository != "PPiquemal/hermes-agent" or operation != "checked_branch_push":
+            raise blocked("checked fast-forward update is not authorized for this operation")
+        if source_branch != destination_branch:
+            raise blocked("checked fast-forward update requires the checked-out destination branch")
+        _verify_local_fast_forward(git, expected_remote_sha, new_sha)
+        code, _, _ = git(["merge-base", "--is-ancestor", new_sha, branch_head])
+        if code:
+            raise blocked("LOCAL_NEW_SHA_UNREACHABLE: new SHA is not on the checked-out branch")
+        return PushPlan(
+            repository, operation, url, destination_branch, new_sha,
+            config["base"], expected_remote_sha,
+        )
+    return PushPlan(repository, operation, url, destination_branch, branch_head, config["base"])
 
 
 def preflight_publication_plan(
@@ -1065,6 +1216,7 @@ def main(
     parser.add_argument("--head")
     parser.add_argument("--ref")
     parser.add_argument("--expected-sha")
+    parser.add_argument("--new-sha")
     args = parser.parse_args(argv)
     try:
         if sum((args.push, args.create_pr, args.dispatch_workflow)) > 1:
@@ -1083,6 +1235,8 @@ def main(
             and repository == "PPiquemal/hermes-agent"
             and args.operation == "checked_branch_push"
         )
+        if args.new_sha is not None and not checked_https_push:
+            raise blocked("new SHA is restricted to checked Hermes fast-forward pushes")
         gh_runner = gh
         resolved_gh_path = gh_path
         needs_gh = (
@@ -1157,6 +1311,8 @@ def main(
                 operation=args.operation,
                 remote=args.remote,
                 destination_branch=args.branch,
+                expected_remote_sha=args.expected_sha if checked_https_push else None,
+                new_sha=args.new_sha if checked_https_push else None,
                 ssh_config=ssh_config,
             )
         if checked_https_push:

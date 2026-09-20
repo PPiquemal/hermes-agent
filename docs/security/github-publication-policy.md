@@ -68,6 +68,18 @@ only at the authorized SHA; otherwise it blocks. A completed push is not success
 until GitHub readback resolves that exact ref to that exact SHA. Git failures keep
 a stable code, exit status and redacted stderr without exposing credentials.
 
+An existing Hermes publication branch can be advanced only through the same
+`checked_branch_push` path with both `--expected-sha <current-remote-sha>` and
+`--new-sha <exact-local-sha>`. Both objects must exist locally, the new SHA must
+be a descendant of the expected SHA and reachable from the checked-out
+destination branch, and GitHub must report the expected SHA both during
+preflight and immediately before the write. A per-invocation `pre-push` check
+requires Git's advertised old object ID to equal the expected SHA; Git's normal
+receive-pack old-ID check then rejects movement after advertisement. The
+publisher issues one normal exact-ref push with no force or deletion option,
+then requires readback of the new SHA. Missing refs, divergence, observed remote
+movement, push failure, or a readback mismatch are terminal.
+
 The checked publisher CLI exposes separate `--push` and `--create-pr` mutation
 modes. Checked RSIP PR creation requires an explicit repository,
 `checked_pr_create` operation, authorized base, valid non-base head, explicit

@@ -13,6 +13,8 @@ from hermes_cli import publication_policy as policy
 _REPOSITORY = "PPiquemal/hermes-agent"
 _BRANCH = "security/checked-workflow-dispatch"
 _SHA = "1" * 40
+_EXPECTED_REMOTE_SHA = "f453330405a18147fdd04a1a54fc2ef3c364a606"
+_NEW_LOCAL_SHA = "b9b99430731de58ea68723b53b1660e6cac9803a"
 _GH = "/opt/hermes/bin/gh"
 _ORIGINAL_GH_VALIDATOR = policy.validate_gh_executable_path
 
@@ -35,6 +37,18 @@ def _plan() -> policy.PushPlan:
         branch=_BRANCH,
         sha=_SHA,
         base="main",
+    )
+
+
+def _update_plan() -> policy.PushPlan:
+    return policy.PushPlan(
+        repository=_REPOSITORY,
+        operation="checked_branch_push",
+        url="https://github.com/PPiquemal/hermes-agent.git",
+        branch=_BRANCH,
+        sha=_NEW_LOCAL_SHA,
+        base="main",
+        expected_remote_sha=_EXPECTED_REMOTE_SHA,
     )
 
 
@@ -407,3 +421,338 @@ def test_gh_symlink_resolution_loop_fails_closed(monkeypatch):
     monkeypatch.setattr(policy.Path, "resolve", loop)
     with pytest.raises(policy.PublicationBlocked, match="executable cannot be resolved"):
         _ORIGINAL_GH_VALIDATOR("/tmp/looped-gh")
+
+
+class FastForwardGit:
+    def __init__(self, *, expected_present=True, descendant=True, push_result=(0, "", "")):
+        self.expected_present = expected_present
+        self.descendant = descendant
+        self.push_result = push_result
+        self.calls = []
+
+    def __call__(self, args):
+        self.calls.append(args)
+        if args == ["rev-parse", "--verify", f"{_EXPECTED_REMOTE_SHA}^{{commit}}"]:
+            if self.expected_present:
+                return 0, _EXPECTED_REMOTE_SHA, ""
+            return 128, "", "unknown revision"
+        if args == ["rev-parse", "--verify", f"{_NEW_LOCAL_SHA}^{{commit}}"]:
+            return 0, _NEW_LOCAL_SHA, ""
+        if args == ["symbolic-ref", "--quiet", "--short", "HEAD"]:
+            return 0, _BRANCH, ""
+        if args == ["rev-parse", "--verify", f"refs/heads/{_BRANCH}^{{commit}}"]:
+            return 0, _NEW_LOCAL_SHA, ""
+        if args == ["merge-base", "--is-ancestor", _EXPECTED_REMOTE_SHA, _NEW_LOCAL_SHA]:
+            return (0, "", "") if self.descendant else (1, "", "")
+        if args == ["merge-base", "--is-ancestor", _NEW_LOCAL_SHA, _NEW_LOCAL_SHA]:
+            return 0, "", ""
+        if "push" in args:
+            return self.push_result
+        raise AssertionError(f"unexpected git call: {args}")
+
+    @property
+    def pushes(self):
+        return [args for args in self.calls if "push" in args]
+
+
+def test_checked_fast_forward_update_pushes_exact_ref_once_and_reads_back_new_sha():
+    git = FastForwardGit()
+    gh = ScriptedGh([
+        _identity(),
+        _repository(),
+        _ref(_EXPECTED_REMOTE_SHA),
+        _ref(_EXPECTED_REMOTE_SHA),
+        _ref(_NEW_LOCAL_SHA),
+    ])
+
+    receipt = policy.execute_checked_push(
+        git,
+        gh,
+        _update_plan(),
+        gh_path=_GH,
+        credential_check=lambda _: None,
+    )
+
+    assert len(git.pushes) == 1
+    command = git.pushes[0]
+    assert command[-1] == f"{_NEW_LOCAL_SHA}:refs/heads/{_BRANCH}"
+    assert any(argument.startswith("core.hooksPath=/") for argument in command)
+    assert not any(argument.startswith("--force") for argument in command)
+    assert "--delete" not in command
+    assert receipt["expected_remote_sha"] == _EXPECTED_REMOTE_SHA
+    assert receipt["remote_readback_sha"] == _NEW_LOCAL_SHA
+    assert receipt["result"] == "fast_forward_updated"
+
+
+def test_pre_push_compare_and_swap_hook_accepts_only_expected_advertised_sha(tmp_path):
+    hook = policy._install_expected_remote_hook(str(tmp_path), _BRANCH, _EXPECTED_REMOTE_SHA)
+    exact = subprocess.run(
+        [hook, "fork", "https://github.com/PPiquemal/hermes-agent.git"],
+        input=(
+            f"refs/heads/{_BRANCH} {_NEW_LOCAL_SHA} "
+            f"refs/heads/{_BRANCH} {_EXPECTED_REMOTE_SHA}\n"
+        ),
+        capture_output=True,
+        text=True,
+    )
+    moved = subprocess.run(
+        [hook, "fork", "https://github.com/PPiquemal/hermes-agent.git"],
+        input=(
+            f"refs/heads/{_BRANCH} {_NEW_LOCAL_SHA} "
+            f"refs/heads/{_BRANCH} {'8' * 40}\n"
+        ),
+        capture_output=True,
+        text=True,
+    )
+
+    assert exact.returncode == 0
+    assert moved.returncode == 42
+    assert "remote ref moved" in moved.stderr
+
+
+def test_fast_forward_executor_rejects_crafted_repository_before_remote_checks():
+    plan = policy.PushPlan(
+        repository="NousResearch/hermes-agent",
+        operation="checked_branch_push",
+        url="https://github.com/NousResearch/hermes-agent.git",
+        branch=_BRANCH,
+        sha=_NEW_LOCAL_SHA,
+        base="main",
+        expected_remote_sha=_EXPECTED_REMOTE_SHA,
+    )
+    gh = ScriptedGh([])
+
+    with pytest.raises(policy.PublicationBlocked, match="CHECKED_PUSH_NOT_AUTHORIZED"):
+        policy.execute_checked_push(
+            FastForwardGit(), gh, plan, gh_path=_GH, credential_check=lambda _: None,
+        )
+
+    assert gh.calls == []
+
+
+def test_fast_forward_executor_rechecks_target_reachability_before_remote_checks():
+    base_git = FastForwardGit()
+
+    def git(args):
+        if args == ["rev-parse", "--verify", f"refs/heads/{_BRANCH}^{{commit}}"]:
+            return 0, "8" * 40, ""
+        if args == ["merge-base", "--is-ancestor", _NEW_LOCAL_SHA, "8" * 40]:
+            return 1, "", ""
+        return base_git(args)
+
+    gh = ScriptedGh([])
+    with pytest.raises(policy.PublicationBlocked, match="LOCAL_NEW_SHA_UNREACHABLE"):
+        policy.execute_checked_push(
+            git, gh, _update_plan(), gh_path=_GH, credential_check=lambda _: None,
+        )
+
+    assert gh.calls == []
+
+
+def test_fast_forward_executor_requires_destination_branch_to_be_checked_out():
+    base_git = FastForwardGit()
+
+    def git(args):
+        if args == ["symbolic-ref", "--quiet", "--short", "HEAD"]:
+            return 0, "another-branch", ""
+        return base_git(args)
+
+    gh = ScriptedGh([])
+    with pytest.raises(policy.PublicationBlocked, match="destination branch is not checked out"):
+        policy.execute_checked_push(
+            git, gh, _update_plan(), gh_path=_GH, credential_check=lambda _: None,
+        )
+
+    assert gh.calls == []
+
+
+def test_checked_fast_forward_rejects_missing_expected_local_sha_before_remote_checks():
+    git = FastForwardGit(expected_present=False)
+    gh = ScriptedGh([])
+
+    with pytest.raises(policy.PublicationBlocked, match="LOCAL_EXPECTED_SHA_MISSING"):
+        policy.execute_checked_push(
+            git, gh, _update_plan(), gh_path=_GH, credential_check=lambda _: None,
+        )
+
+    assert git.pushes == []
+    assert gh.calls == []
+
+
+def test_checked_fast_forward_rejects_local_divergence_before_remote_checks():
+    git = FastForwardGit(descendant=False)
+    gh = ScriptedGh([])
+
+    with pytest.raises(policy.PublicationBlocked, match="LOCAL_FAST_FORWARD_REQUIRED"):
+        policy.execute_checked_push(
+            git, gh, _update_plan(), gh_path=_GH, credential_check=lambda _: None,
+        )
+
+    assert git.pushes == []
+    assert gh.calls == []
+
+
+def test_checked_fast_forward_rejects_missing_expected_remote_ref_without_push():
+    git = FastForwardGit()
+    gh = ScriptedGh([_identity(), _repository(), _MISSING])
+
+    with pytest.raises(policy.PublicationBlocked, match="REMOTE_EXPECTED_SHA_MISSING"):
+        policy.execute_checked_push(
+            git, gh, _update_plan(), gh_path=_GH, credential_check=lambda _: None,
+        )
+
+    assert git.pushes == []
+
+
+def test_checked_fast_forward_rejects_remote_movement_without_push():
+    git = FastForwardGit()
+    gh = ScriptedGh([_identity(), _repository(), _ref("4" * 40)])
+
+    with pytest.raises(policy.PublicationBlocked, match="REMOTE_REF_MOVED"):
+        policy.execute_checked_push(
+            git, gh, _update_plan(), gh_path=_GH, credential_check=lambda _: None,
+        )
+
+    assert git.pushes == []
+
+
+def test_checked_fast_forward_rereads_remote_immediately_before_push():
+    git = FastForwardGit()
+    gh = ScriptedGh([
+        _identity(),
+        _repository(),
+        _ref(_EXPECTED_REMOTE_SHA),
+        _ref("5" * 40),
+    ])
+
+    with pytest.raises(policy.PublicationBlocked, match="REMOTE_REF_MOVED"):
+        policy.execute_checked_push(
+            git, gh, _update_plan(), gh_path=_GH, credential_check=lambda _: None,
+        )
+
+    assert git.pushes == []
+
+
+def test_checked_fast_forward_rejects_post_push_readback_mismatch():
+    git = FastForwardGit()
+    gh = ScriptedGh([
+        _identity(),
+        _repository(),
+        _ref(_EXPECTED_REMOTE_SHA),
+        _ref(_EXPECTED_REMOTE_SHA),
+        _ref("6" * 40),
+    ])
+
+    with pytest.raises(policy.PublicationBlocked, match="REMOTE_REF_READBACK_MISMATCH"):
+        policy.execute_checked_push(
+            git, gh, _update_plan(), gh_path=_GH, credential_check=lambda _: None,
+        )
+
+    assert len(git.pushes) == 1
+
+
+def _fast_forward_plan_git(*, target_reachable=True):
+    branch_head = "7" * 40
+
+    def git(args):
+        values = {
+            ("config", "--get-all", "remote.fork.pushurl"): (1, "", ""),
+            ("config", "--get-all", "remote.fork.url"): (
+                0, "https://github.com/PPiquemal/hermes-agent.git\n", "",
+            ),
+            ("remote", "get-url", "--push", "--all", "fork"): (
+                0, "https://github.com/PPiquemal/hermes-agent.git\n", "",
+            ),
+            ("symbolic-ref", "--quiet", "--short", "HEAD"): (0, f"{_BRANCH}\n", ""),
+            ("rev-parse", "--verify", f"refs/heads/{_BRANCH}^{{commit}}"): (
+                0, branch_head, "",
+            ),
+            ("rev-parse", "--verify", f"{_EXPECTED_REMOTE_SHA}^{{commit}}"): (
+                0, _EXPECTED_REMOTE_SHA, "",
+            ),
+            ("rev-parse", "--verify", f"{_NEW_LOCAL_SHA}^{{commit}}"): (
+                0, _NEW_LOCAL_SHA, "",
+            ),
+            ("merge-base", "--is-ancestor", _EXPECTED_REMOTE_SHA, _NEW_LOCAL_SHA): (
+                0, "", "",
+            ),
+            ("merge-base", "--is-ancestor", _NEW_LOCAL_SHA, branch_head): (
+                0 if target_reachable else 1, "", "",
+            ),
+        }
+        if args[:2] == ["config", "--get-regexp"]:
+            return 1, "", ""
+        if args[0] == "check-ref-format":
+            return 0, "", ""
+        return values[tuple(args)]
+
+    return git
+
+
+def test_resolve_push_plan_binds_expected_remote_and_explicit_new_sha():
+    plan = policy.resolve_push_plan(
+        _fast_forward_plan_git(),
+        repository=_REPOSITORY,
+        operation="checked_branch_push",
+        remote="fork",
+        destination_branch=_BRANCH,
+        expected_remote_sha=_EXPECTED_REMOTE_SHA,
+        new_sha=_NEW_LOCAL_SHA,
+    )
+
+    assert plan.sha == _NEW_LOCAL_SHA
+    assert plan.expected_remote_sha == _EXPECTED_REMOTE_SHA
+    assert plan.branch == _BRANCH
+
+
+def test_resolve_push_plan_rejects_new_sha_not_reachable_from_checked_out_branch():
+    with pytest.raises(policy.PublicationBlocked, match="LOCAL_NEW_SHA_UNREACHABLE"):
+        policy.resolve_push_plan(
+            _fast_forward_plan_git(target_reachable=False),
+            repository=_REPOSITORY,
+            operation="checked_branch_push",
+            remote="fork",
+            destination_branch=_BRANCH,
+            expected_remote_sha=_EXPECTED_REMOTE_SHA,
+            new_sha=_NEW_LOCAL_SHA,
+        )
+
+
+def test_cli_checked_fast_forward_binds_both_exact_sha_arguments(capsys):
+    read_git = _fast_forward_plan_git()
+    pushes = []
+
+    def git(args):
+        if "push" in args:
+            pushes.append(args)
+            return 0, "", ""
+        return read_git(args)
+
+    gh = ScriptedGh([
+        _identity(),
+        _repository(),
+        _ref(_EXPECTED_REMOTE_SHA),
+        _ref(_EXPECTED_REMOTE_SHA),
+        _ref(_NEW_LOCAL_SHA),
+    ])
+    result = policy.main(
+        [
+            "--repository", _REPOSITORY,
+            "--operation", "checked_branch_push",
+            "--push",
+            "--remote", "fork",
+            "--branch", _BRANCH,
+            "--expected-sha", _EXPECTED_REMOTE_SHA,
+            "--new-sha", _NEW_LOCAL_SHA,
+        ],
+        git=git,
+        gh=gh,
+        gh_path=_GH,
+        credential_check=lambda _: None,
+    )
+
+    assert result == 0
+    assert len(pushes) == 1
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["expected_remote_sha"] == _EXPECTED_REMOTE_SHA
+    assert receipt["sha"] == _NEW_LOCAL_SHA
