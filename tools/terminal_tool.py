@@ -851,6 +851,11 @@ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *,
     """Run tirith + dangerous-command guards; ``force`` skips them entirely.
     Raises :class:`_Rejected` when the command may not run (denied, or pending
     gateway approval)."""
+    from tools.github_publication_guard import github_publication_block
+
+    publication_block = github_publication_block(command)
+    if publication_block:
+        raise _Rejected(_error_json(publication_block, status="blocked"))
     if force:
         return _ApprovalVerdict(approved_run=True)
     approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))

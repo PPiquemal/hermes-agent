@@ -1,0 +1,51 @@
+{
+  "repositories": {
+    "PPiquemal/hermes-agent": {
+      "remote": "fork",
+      "base": "main",
+      "operations": [
+        "hermes_branch",
+        "hermes_pr",
+        "skills",
+        "autofix",
+        "update",
+        "checked_branch_push",
+        "checked_pr_create"
+      ],
+      "allow_github_com_urls": true,
+      "operation_remotes": {
+        "autofix": "origin",
+        "update": "origin"
+      },
+      "workflows": {},
+      "ssh_aliases": {}
+    },
+    "PPiquemal/rsip": {
+      "remote": "origin",
+      "base": "main",
+      "operations": [
+        "checked_branch_push",
+        "checked_pr_create",
+        "checked_workflow_dispatch"
+      ],
+      "allow_github_com_urls": false,
+      "operation_remotes": {},
+      "workflows": {
+        "checked_workflow_dispatch": {
+          "id": 265670631,
+          "name": "RSIP Tests",
+          "path": ".github/workflows/test.yml"
+        }
+      },
+      "ssh_aliases": {
+        "github-rsip": {
+          "hostname": "github.com",
+          "user": "git"
+        }
+      }
+    }
+  },
+  "read_only_repositories": [
+    "NousResearch/hermes-agent"
+  ]
+}

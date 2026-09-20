@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from pathlib import Path
+from types import ModuleType
 from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -142,6 +143,24 @@ def _stable_prompt(agent):
         patch("agent.prompt_builder.build_context_files_prompt", return_value=""),
     ):
         return build_system_prompt_parts(agent)["stable"]
+
+
+def test_publication_policy_guidance_is_in_stable_session_prompt(monkeypatch):
+    """The worker policy is rendered once with the common system-prompt scaffold."""
+    import sys
+
+    policy = ModuleType("hermes_cli.publication_policy")
+    policy.__dict__.update(
+        PUBLICATION_INVARIANT="TEST_PUBLICATION_INVARIANT",
+        require_repository=lambda target: target,
+        require_push_url=lambda url: url,
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.publication_policy", policy)
+
+    stable = _stable_prompt(_make_agent(valid_tool_names=["terminal"]))
+
+    assert "TEST_PUBLICATION_INVARIANT" in stable
+    assert "resumed, and delegated workers" in stable
 
 
 def _prompt_parts(agent):
@@ -396,6 +415,7 @@ def test_build_system_prompt_records_stable_prefix():
 def test_coding_prompt_orders_shared_context_before_workspace(monkeypatch):
     """Keep workspace guidance intact after the shared context."""
     import agent.system_prompt as system_prompt
+    from agent.prompt_builder import publication_worker_policy_guidance
 
     agent = _make_agent(
         valid_tool_names=["read_file"],
@@ -421,6 +441,7 @@ def test_coding_prompt_orders_shared_context_before_workspace(monkeypatch):
     expected = "\n\n".join((
         "IDENTITY",
         "HELP",
+        publication_worker_policy_guidance(),
         "STEER",
         "CODING_STABLE",
         "SYSTEM_MESSAGE",
@@ -449,7 +470,7 @@ def test_coding_prompt_orders_shared_context_before_workspace(monkeypatch):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:5])
 
 
 class TestTelegramRichMessagesHint:

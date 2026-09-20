@@ -496,7 +496,7 @@ def _identity_parts(agent: Any, ctx_len: Optional[int]) -> Tuple[List[str], bool
 
 def _guidance_parts(agent: Any) -> List[str]:
     """Universal + tool-aware + model-gated guidance blocks, each gated by its config.yaml key."""
-    parts: List[str] = []
+    parts: List[str] = [_pb.publication_worker_policy_guidance()]
     if agent.valid_tool_names:
         parts += [
             text for flag, text in (

@@ -10,6 +10,12 @@ import path from 'node:path'
 
 import simpleGit from 'simple-git'
 
+import {
+  createPullRequestForPublishedBranch,
+  processPublicationCommandRunner,
+  publishBranch,
+  validatePublication
+} from './github-publication'
 import { resolveRequestedPathForIpc } from './hardening'
 
 const COMMIT_CONTEXT_DIFF_MAX_CHARS = 120_000
@@ -464,6 +470,11 @@ async function reviewRevParse(repoPath, ref, gitBin) {
 async function reviewCommit(repoPath, message, push, gitBin) {
   const cwd = resolveRequestedPathForIpc(repoPath, { purpose: 'Review commit' })
   const git = gitFor(cwd, gitBin)
+
+  if (push) {
+    await validatePublication(cwd, processPublicationCommandRunner(), gitBin || 'git')
+  }
+
   const status = await git.status()
 
   if (status.staged.length === 0) {
@@ -473,13 +484,7 @@ async function reviewCommit(repoPath, message, push, gitBin) {
   await git.commit(message)
 
   if (push) {
-    const fresh = await git.status()
-
-    if (fresh.tracking) {
-      await git.push()
-    } else if (fresh.current) {
-      await git.raw(['push', '-u', 'origin', fresh.current])
-    }
+    await reviewPush(repoPath, gitBin)
   }
 
   return { ok: true }
@@ -538,14 +543,7 @@ async function reviewCommitContext(repoPath, gitBin) {
 
 async function reviewPush(repoPath, gitBin) {
   const cwd = resolveRequestedPathForIpc(repoPath, { purpose: 'Review push' })
-  const git = gitFor(cwd, gitBin)
-  const status = await git.status()
-
-  if (status.tracking) {
-    await git.push()
-  } else if (status.current) {
-    await git.raw(['push', '-u', 'origin', status.current])
-  }
+  await publishBranch(cwd, processPublicationCommandRunner(), gitBin || 'git')
 
   return { ok: true }
 }
@@ -764,18 +762,10 @@ async function reviewPrList(repoPath, ghBin, branches, numbers) {
 // letting gh fill title/body from the commits. Returns the new PR url.
 async function reviewCreatePr(repoPath, gitBin, ghBin) {
   const cwd = resolveRequestedPathForIpc(repoPath, { purpose: 'Review create PR' })
+  const runner = processPublicationCommandRunner()
+  const created = await createPullRequestForPublishedBranch(cwd, runner, runner, ghEnv(ghBin), gitBin || 'git', ghBin || 'gh')
 
-  await reviewPush(repoPath, gitBin).catch(() => undefined)
-
-  const created = await runGh(['pr', 'create', '--fill'], cwd, ghBin)
-
-  if (!created.ok) {
-    throw new Error('gh pr create failed (is gh installed and authenticated?)')
-  }
-
-  const url = created.stdout.trim().split('\n').filter(Boolean).pop() || ''
-
-  return { url }
+  return { url: created.url }
 }
 
 // Compact working-tree status for the composer coding rail: branch, ahead/behind,

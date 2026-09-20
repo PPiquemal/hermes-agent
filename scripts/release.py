@@ -2552,6 +2552,13 @@ def main():
                         help="Write changelog to file instead of stdout")
     args = parser.parse_args()
 
+    if args.publish:
+        print(
+            "BLOCKED: automated release publication is not authorized in this Hermes development "
+            "environment; a new explicit user authorization is required before any release work."
+        )
+        return 1
+
     # Determine CalVer date
     if args.date:
         calver_date = args.date

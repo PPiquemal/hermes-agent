@@ -6,7 +6,16 @@ import path from 'node:path'
 
 import { afterEach, test } from 'vitest'
 
-import { gitFor, repoStatus, resolveRenamePath, REVIEW_FILE_CAP, reviewList } from './git-review-ops'
+import {
+  gitFor,
+  repoStatus,
+  resolveRenamePath,
+  REVIEW_FILE_CAP,
+  reviewCommit,
+  reviewCreatePr,
+  reviewList,
+  reviewPush
+} from './git-review-ops'
 
 const tempDirs: string[] = []
 
@@ -116,4 +125,109 @@ test('reviewList caps the file payload returned to the renderer', async () => {
   const result = await reviewList(dir, 'uncommitted', null, 'git')
 
   assert.equal(result.files.length, REVIEW_FILE_CAP)
+})
+
+test('reviewCommit with push blocks unsafe publication configuration before creating a local commit', async () => {
+  const repo = makeRepo()
+  const initialHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim()
+
+  fs.writeFileSync(path.join(repo, 'tracked.txt'), 'changed\n')
+  execFileSync('git', ['config', 'remote.fork.push', 'refs/heads/*:refs/heads/*'], { cwd: repo })
+
+  await assert.rejects(
+    () => reviewCommit(repo, 'must not commit', true, 'git'),
+    (error: unknown) => error instanceof Error && error.message.startsWith('Publication BLOCKED:')
+  )
+
+  assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim(), initialHead)
+})
+
+function writePushInterceptingGit(dir: string, logPath: string) {
+  const wrapper = path.join(dir, 'git-publish-interceptor')
+
+  fs.writeFileSync(
+    wrapper,
+    `#!/bin/sh
+for argument in "$@"; do
+  if [ "$argument" = "push" ]; then
+    printf '%s\\n' "$@" > ${JSON.stringify(logPath)}
+    exit 0
+  fi
+done
+exec git "$@"
+`
+  )
+  fs.chmodSync(wrapper, 0o755)
+
+  return wrapper
+}
+
+test('reviewPush uses the fail-closed publisher and intercepts the only external write', async () => {
+  if (process.platform === 'win32') {
+    return
+  }
+
+  const repo = makeRepo()
+  const logPath = path.join(repo, 'push-args.txt')
+  const gitBin = writePushInterceptingGit(repo, logPath)
+
+  execFileSync('git', ['switch', '-qc', 'feature/review-push'], { cwd: repo })
+  execFileSync('git', ['remote', 'add', 'fork', 'https://github.com/PPiquemal/hermes-agent.git'], { cwd: repo })
+
+  await reviewPush(repo, gitBin)
+
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim()
+
+  assert.deepEqual(fs.readFileSync(logPath, 'utf8').trim().split('\n'), [
+    '-c',
+    'push.followTags=false',
+    '-c',
+    'push.recurseSubmodules=no',
+    '-c',
+    'http.followRedirects=false',
+    'push',
+    '--porcelain',
+    '--',
+    'https://github.com/PPiquemal/hermes-agent.git',
+    `${head}:refs/heads/feature/review-push`
+  ])
+})
+
+test('reviewCreatePr passes an explicit GitHub host-qualified target after the intercepted push', async () => {
+  if (process.platform === 'win32') {
+    return
+  }
+
+  const repo = makeRepo()
+  const pushLog = path.join(repo, 'push-args.txt')
+  const ghLog = path.join(repo, 'gh-args.txt')
+  const gitBin = writePushInterceptingGit(repo, pushLog)
+  const ghBin = path.join(repo, 'gh-publish-interceptor')
+
+  fs.writeFileSync(
+    ghBin,
+    `#!/bin/sh
+printf '%s\\n' "$@" > ${JSON.stringify(ghLog)}
+printf '%s\\n' 'https://github.com/PPiquemal/hermes-agent/pull/42'
+`
+  )
+  fs.chmodSync(ghBin, 0o755)
+  execFileSync('git', ['switch', '-qc', 'feature/review-pr'], { cwd: repo })
+  execFileSync('git', ['remote', 'add', 'fork', 'https://github.com/PPiquemal/hermes-agent.git'], { cwd: repo })
+
+  const result = await reviewCreatePr(repo, gitBin, ghBin)
+
+  assert.equal(result.url, 'https://github.com/PPiquemal/hermes-agent/pull/42')
+  assert.equal(fs.existsSync(pushLog), true)
+  assert.deepEqual(fs.readFileSync(ghLog, 'utf8').trim().split('\n'), [
+    'pr',
+    'create',
+    '--repo',
+    'github.com/PPiquemal/hermes-agent',
+    '--head',
+    'PPiquemal:feature/review-pr',
+    '--base',
+    'main',
+    '--fill'
+  ])
 })

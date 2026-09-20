@@ -159,6 +159,13 @@ HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS = (
 )
 
 
+def publication_worker_policy_guidance() -> str:
+    """Shared immutable worker policy, rendered only during prompt assembly."""
+    from tools.github_publication_guard import publication_worker_policy_guidance as _guidance
+
+    return _guidance()
+
+
 # Keep the every-session memory scope even when task knowledge cannot be saved as a skill.
 def build_memory_guidance(
     memory_enabled: bool = True, profile_enabled: bool = True, *, skill_manage_available: bool = True,

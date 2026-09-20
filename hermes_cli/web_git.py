@@ -17,6 +17,7 @@ import subprocess
 from pathlib import Path
 
 from hermes_cli._subprocess_compat import harden_git_argv, noninteractive_git_env
+from hermes_cli.publication_policy import blocked, resolve_push_plan
 
 _GIT_TIMEOUT = 30
 _GH_TIMEOUT = 30
@@ -339,6 +340,12 @@ def _has_staged(raw: str) -> bool:
 
 def review_commit(cwd: str, message: str, push: bool) -> dict:
     """Commit the working tree; stage everything first when nothing is staged."""
+    if push:
+        resolve_push_plan(
+            lambda args: _git(cwd, args),
+            repository="PPiquemal/hermes-agent",
+            operation="hermes_branch",
+        )
     if not _has_staged(_status_z(cwd)[1]):
         _git_ok(cwd, ["add", "-A"])
     _git_ok(cwd, ["commit", "-m", message])
@@ -347,13 +354,17 @@ def review_commit(cwd: str, message: str, push: bool) -> dict:
     return {"ok": True}
 
 
-def _review_push(cwd: str) -> None:
-    if _git_line(cwd, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]):
-        _git_ok(cwd, ["push"])
-        return
-    branch = _git_line(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])
-    if branch and branch != "HEAD":
-        _git_ok(cwd, ["push", "-u", "origin", branch])
+def _review_push(cwd: str):
+    plan = resolve_push_plan(
+        lambda args: _git(cwd, args),
+        repository="PPiquemal/hermes-agent",
+        operation="hermes_branch",
+    )
+    try:
+        _git_ok(cwd, plan.argv())
+    except RuntimeError as exc:
+        raise blocked("authorized push failed") from exc
+    return plan
 
 
 def review_push(cwd: str) -> dict:
@@ -486,14 +497,15 @@ def review_pr_list(cwd: str, branches: list[str], numbers: list[int] = None) -> 
 
 def review_create_pr(cwd: str) -> dict:
     """Create a PR for the current branch (push first), letting gh fill title/body."""
-    try:
-        _review_push(cwd)
-    except RuntimeError:
-        pass
-    created, out = _gh(cwd, ["pr", "create", "--fill"])
+    plan = _review_push(cwd)
+    if _git_line(cwd, ["rev-parse", "HEAD"]) != plan.sha:
+        raise blocked("HEAD changed after push")
+    created, out = _gh(cwd, plan.pr_argv())
     if not created:
-        raise RuntimeError("gh pr create failed (is gh installed and authenticated?)")
+        raise blocked("PR creation failed")
     url = next((line for line in reversed(out.strip().splitlines()) if line.strip()), "")
+    if not re.fullmatch(rf"https://github\.com/{re.escape(plan.repository)}/pull/[0-9]+", url):
+        raise blocked("PR creation returned an unverifiable target")
     return {"url": url}
 
 

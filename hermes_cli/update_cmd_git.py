@@ -228,8 +228,27 @@ def _mark_skip_upstream_prompt():
 
 
 def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
-    """Push updated main to origin (sync fork); True on success."""
-    return _git_ok(git_cmd, ["push", "origin", "main", "--force-with-lease"], cwd, network=True)
+    """Sync only a verified authorized origin; a failure is not recoverable."""
+    from hermes_cli.update_cmd import _git_run
+    from hermes_cli.publication_policy import blocked, resolve_push_plan
+
+    def read(args):
+        try:
+            result = _git_run(git_cmd, args, cwd)
+            return result.returncode, result.stdout, result.stderr
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise blocked("cannot verify fork sync destination") from exc
+
+    plan = resolve_push_plan(
+        read,
+        repository="PPiquemal/hermes-agent",
+        operation="update",
+        remote="origin",
+        branch="main",
+    )
+    if not _git_ok(git_cmd, plan.argv(), cwd, network=True):
+        raise blocked("fork sync push failed")
+    return True
 
 
 def _offer_upstream_remote(git_cmd: list[str], cwd: Path, *, assume_yes: bool, input_fn) -> bool:

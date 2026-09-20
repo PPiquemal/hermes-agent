@@ -1153,9 +1153,11 @@ def do_publish(skill_path: str, target: str = "github", repo: str = "",
         return
 
     if target == "github":
-        if not repo:
-            _print_error(c, "--repo required for GitHub publish.\n"
-                            "Usage: hermes skills publish <path> --to github --repo owner/repo")
+        from hermes_cli.publication_policy import PublicationBlocked, require_repository
+        try:
+            require_repository(repo, "skills")
+        except PublicationBlocked as exc:
+            _print_error(c, str(exc))
             return
         auth = GitHubAuth()
         if not auth.is_authenticated():
@@ -1173,65 +1175,70 @@ def do_publish(skill_path: str, target: str = "github", repo: str = "",
 
 
 def _github_publish(skill_path: Path, skill_name: str, target_repo: str, auth) -> tuple:
-    """Fork, branch, upload, and open a PR with the skill. Returns (success, message)."""
+    """Publish only inside the authorized repository; never fork or retry a failed write."""
     import base64
     import httpx
-    headers = auth.get_headers()
-    api = "https://api.github.com/repos"
-
-    def call(method: str, path: str, timeout: int = 15, **kw):
-        return getattr(httpx, method)(f"{api}/{path}", headers=headers, timeout=timeout, **kw)
+    from urllib.parse import quote
+    from hermes_cli.publication_policy import PublicationBlocked, blocked, load_policy, require_repository
 
     try:
-        resp = call("post", f"{target_repo}/forks", timeout=30)
-        if resp.status_code in {200, 202}:
-            fork_repo = resp.json()["full_name"]
-        elif resp.status_code == 403:
-            return False, "GitHub token lacks permission to fork repos"
-        else:
-            return False, f"Failed to fork {target_repo}: {resp.status_code}"
-    except httpx.HTTPError as e:
-        return False, f"Network error forking repo: {e}"
+        require_repository(target_repo, "skills")
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", skill_name):
+            raise blocked("invalid skill publication name")
+        base = load_policy()["repositories"][target_repo]["base"]
+        headers = auth.get_headers()
+        api = f"https://api.github.com/repos/{target_repo}"
 
-    try:
-        default_branch = call("get", target_repo).json().get("default_branch", "main")
-    except Exception:
-        default_branch = "main"
-    try:
-        ref = call("get", f"{fork_repo}/git/refs/heads/{default_branch}").json()
-        base_sha = ref["object"]["sha"]
-    except Exception as e:
-        return False, f"Failed to get base branch: {e}"
+        def call(method: str, path: str, expected: int, **kw):
+            response = getattr(httpx, method)(
+                f"{api}{path}", headers=headers, timeout=15, follow_redirects=False, **kw
+            )
+            if response.status_code != expected:
+                raise blocked(f"GitHub {method} failed with HTTP {response.status_code}")
+            return response
 
-    branch_name = f"add-skill-{skill_name}"
-    try:
-        call("post", f"{fork_repo}/git/refs",
-             json={"ref": f"refs/heads/{branch_name}", "sha": base_sha})
-    except Exception as e:
-        return False, f"Failed to create branch: {e}"
+        files = []
+        for f in skill_path.rglob("*"):
+            if f.is_symlink():
+                raise blocked("skill publication contains a symlink")
+            if f.is_file():
+                files.append((f.relative_to(skill_path).as_posix(), base64.b64encode(f.read_bytes()).decode()))
+        if not files:
+            raise blocked("no skill files to publish")
+        metadata = call("get", "", 200).json()
+        if metadata.get("full_name") != target_repo:
+            raise blocked("GitHub resolved a different repository")
+        ref = call("get", f"/git/ref/heads/{quote(base, safe='')}", 200).json()
+        target = ref.get("object") if isinstance(ref, dict) else None
+        if (
+            not isinstance(ref, dict)
+            or ref.get("ref") != f"refs/heads/{base}"
+            or not isinstance(target, dict)
+            or target.get("type") != "commit"
+        ):
+            raise blocked("unverifiable base ref identity")
+        base_sha = target.get("sha")
+        if not isinstance(base_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", base_sha):
+            raise blocked("unverifiable base commit")
+        branch_name = f"add-skill-{skill_name}"
+        call("post", "/git/refs", 201, json={"ref": f"refs/heads/{branch_name}", "sha": base_sha})
+        for rel, content in files:
+            call("put", f"/contents/skills/{skill_name}/{quote(rel)}", 201,
+                 json={"message": f"Add {skill_name} skill: {rel}", "content": content, "branch": branch_name})
 
-    for f in skill_path.rglob("*"):
-        if not f.is_file():
-            continue
-        rel = str(f.relative_to(skill_path))
-        try:
-            call("put", f"{fork_repo}/contents/skills/{skill_name}/{rel}",
-                 json={"message": f"Add {skill_name} skill: {rel}",
-                       "content": base64.b64encode(f.read_bytes()).decode(), "branch": branch_name})
-        except Exception as e:
-            return False, f"Failed to upload {rel}: {e}"
-
-    try:
-        resp = call("post", f"{target_repo}/pulls", json={
+        resp = call("post", "/pulls", 201, json={
             "title": f"Add skill: {skill_name}",
             "body": f"Submitting the `{skill_name}` skill via Hermes Skills Hub.\n\n"
                     f"This skill was scanned by the Hermes Skills Guard before submission.",
-            "head": f"{fork_repo.split('/')[0]}:{branch_name}", "base": default_branch})
-        if resp.status_code == 201:
-            return True, f"PR created: {resp.json().get('html_url', '')}"
-        return False, f"Failed to create PR: {resp.status_code} {resp.text[:200]}"
-    except httpx.HTTPError as e:
-        return False, f"Network error creating PR: {e}"
+            "head": branch_name, "base": base})
+        url = resp.json().get("html_url", "")
+        if not isinstance(url, str) or not re.fullmatch(rf"https://github\.com/{re.escape(target_repo)}/pull/[0-9]+", url):
+            raise blocked("unverifiable PR result")
+        return True, f"PR created: {url}"
+    except PublicationBlocked as exc:
+        return False, str(exc)
+    except (httpx.HTTPError, OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False, str(blocked("skill publication failed or returned unverifiable data"))
 
 
 def do_snapshot_export(output_path: str, console: Optional[Console] = None) -> None:
