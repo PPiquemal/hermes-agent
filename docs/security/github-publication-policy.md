@@ -56,6 +56,18 @@ recognizes common assignment/`env`/`command`/`exec` wrappers, Windows executable
 names, and the standalone `git-push` executable; unverifiable privilege wrappers
 fail closed. Git URL rewrite configuration and implicit `gh api` POSTs are writes.
 
+For checked HTTPS pushes to `PPiquemal/hermes-agent`, the publisher rejects
+SSH destinations, resolves `gh` to an absolute executable, verifies that the
+binary identifies as GitHub CLI, verifies the authenticated login is exactly
+`PPiquemal`, verifies repository `permissions.push == true`, and probes
+`gh auth git-credential` before the first write. The helper is installed only by
+per-process `git -c credential.helper= -c credential.helper='!...'` arguments;
+global/system Git configuration remains isolated and `credential.helper=store`
+is never used. Prompts remain disabled. An existing destination ref is accepted
+only at the authorized SHA; otherwise it blocks. A completed push is not success
+until GitHub readback resolves that exact ref to that exact SHA. Git failures keep
+a stable code, exit status and redacted stderr without exposing credentials.
+
 The checked publisher CLI exposes separate `--push` and `--create-pr` mutation
 modes. Checked RSIP PR creation requires an explicit repository,
 `checked_pr_create` operation, authorized base, valid non-base head, explicit

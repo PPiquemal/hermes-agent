@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import shlex
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -210,6 +213,10 @@ def require_push_url(
         raise blocked("effective push URL is missing, ambiguous or outside the whitelist")
 
     escaped = re.escape(repository)
+    if repository == "PPiquemal/hermes-agent" and operation == "checked_branch_push":
+        if re.fullmatch(rf"https://github\.com/{escaped}(?:\.git)?", url):
+            return url
+        raise blocked("checked Hermes branch push requires the exact authorized HTTPS destination")
     if config["allow_github_com_urls"]:
         if re.fullmatch(rf"https://github\.com/{escaped}(?:\.git)?", url):
             return url
@@ -262,8 +269,16 @@ class PushPlan:
     sha: str
     base: str
 
-    def argv(self) -> list[str]:
+    def argv(self, gh_path: str | None = None) -> list[str]:
+        credential_args: list[str] = []
+        if gh_path is not None:
+            helper = f"!{shlex.quote(gh_path)} auth git-credential"
+            credential_args = [
+                "-c", "credential.helper=",
+                "-c", f"credential.helper={helper}",
+            ]
         return [
+            *credential_args,
             "-c", "push.followTags=false",
             "-c", "push.recurseSubmodules=no",
             "-c", "http.followRedirects=false",
@@ -360,6 +375,253 @@ def _gh_list(
     if code or not isinstance(value, list):
         raise blocked(reason)
     return value
+
+
+def sanitize_publication_evidence(value: object, *, limit: int = 2000) -> str:
+    """Return bounded diagnostic text with credential-shaped values removed."""
+    text = str(value or "").replace("\x00", "")
+    text = re.sub(
+        r"(?i)(authorization\s*:\s*(?:bearer|token|basic)\s+)[^\s]+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b", "[REDACTED]", text)
+    text = re.sub(
+        r"(?i)\b(token|access_token|refresh_token|client_secret|password)\b"
+        r"(\s*[:=]\s*[\"']?)[^,\s\"']+",
+        r"\1\2[REDACTED]",
+        text,
+    )
+    text = re.sub(r"https://[^/@\s]+@github\.com", "https://[REDACTED]@github.com", text)
+    text = "".join(character for character in text if character in "\n\r\t" or ord(character) >= 32)
+    return text.strip()[:limit]
+
+
+def validate_gh_executable_path(
+    candidate: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> str:
+    if (
+        not isinstance(candidate, str)
+        or not os.path.isabs(candidate)
+        or candidate != candidate.strip()
+        or any(character in candidate for character in "\r\n\0")
+    ):
+        raise blocked("GH_CLI_UNAVAILABLE: gh path is not one absolute executable")
+    try:
+        resolved = Path(candidate).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise blocked("GH_CLI_UNAVAILABLE: gh executable cannot be resolved") from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise blocked("GH_CLI_UNAVAILABLE: resolved gh path is not executable")
+    try:
+        version = run(
+            [str(resolved), "--version"], capture_output=True, text=True,
+            timeout=10, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise blocked("GH_CLI_UNAVAILABLE: gh executable validation failed") from exc
+    if version.returncode or not re.match(r"^gh version [0-9]+(?:\.[0-9]+)+", version.stdout):
+        raise blocked("GH_CLI_UNAVAILABLE: executable does not identify as GitHub CLI")
+    return str(resolved)
+
+
+def resolve_gh_executable(which: Callable[[str], str | None] = shutil.which) -> str:
+    """Resolve ``gh`` to one absolute executable without trusting a later PATH lookup."""
+    candidate = which("gh")
+    if not candidate:
+        raise blocked("GH_CLI_UNAVAILABLE: gh does not resolve to an executable")
+    return validate_gh_executable_path(candidate)
+
+
+def github_cli_env() -> dict[str, str]:
+    from hermes_cli._subprocess_compat import noninteractive_git_env
+
+    env = noninteractive_git_env()
+    env.pop("GH_REPO", None)
+    env["GH_HOST"] = "github.com"
+    env["GH_PROMPT_DISABLED"] = "1"
+    return env
+
+
+def checked_gh_runner(gh_path: str) -> Callable[[list[str]], tuple[int, str, str]]:
+    """Build a pinned, non-interactive GitHub CLI runner."""
+    gh_path = validate_gh_executable_path(gh_path)
+
+    def run(command: list[str]) -> tuple[int, str, str]:
+        try:
+            result = subprocess.run(
+                [gh_path, *command], capture_output=True, text=True,
+                timeout=30, stdin=subprocess.DEVNULL, env=github_cli_env(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return 1, "", "gh invocation failed"
+        return result.returncode, result.stdout, result.stderr
+
+    return run
+
+
+def validate_gh_credential(
+    gh_path: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> None:
+    """Prove the pinned gh helper can supply one credential without exposing it."""
+    request = "protocol=https\nhost=github.com\n\n"
+    try:
+        result = run(
+            [gh_path, "auth", "git-credential", "get"],
+            input=request,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=github_cli_env(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise blocked("CREDENTIAL_UNAVAILABLE: gh credential helper invocation failed") from exc
+    evidence = sanitize_publication_evidence(result.stderr)
+    if result.returncode:
+        raise blocked(
+            f"CREDENTIAL_UNAVAILABLE: gh credential helper exit_status={result.returncode} "
+            f"stderr={evidence or '[empty]'}"
+        )
+    fields = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in {"username", "password"}:
+            fields[key] = value
+    if not fields.get("username") or not fields.get("password"):
+        raise blocked("CREDENTIAL_UNAVAILABLE: gh credential helper returned no usable credential")
+    fields.clear()
+
+
+def _preflight_push_identity_and_permission(
+    gh: Callable[[list[str]], tuple[int, str, str]],
+    repository: str,
+) -> None:
+    identity = _gh_json(
+        gh,
+        ["api", "--hostname", "github.com", "--method", "GET", "user"],
+        "GITHUB_IDENTITY_UNVERIFIABLE",
+    )
+    if identity.get("login") != "PPiquemal":
+        raise blocked("GITHUB_IDENTITY_MISMATCH: authenticated login must be exactly PPiquemal")
+    metadata = _gh_json(
+        gh,
+        ["api", "--hostname", "github.com", "--method", "GET", f"repos/{repository}"],
+        "GITHUB_PERMISSION_UNVERIFIABLE",
+    )
+    permissions = metadata.get("permissions")
+    if metadata.get("full_name") != repository or not isinstance(permissions, dict):
+        raise blocked("GITHUB_PERMISSION_UNVERIFIABLE: repository identity or permissions are missing")
+    if permissions.get("push") is not True:
+        raise blocked("GITHUB_PUSH_PERMISSION_DENIED: authenticated identity lacks push permission")
+
+
+def _is_unambiguous_missing_ref(code: int, out: str, err: str) -> bool:
+    if code != 1 or err.strip() != "gh: Not Found (HTTP 404)":
+        return False
+    try:
+        payload = json.loads(out)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("message") == "Not Found"
+        and str(payload.get("status")) == "404"
+    )
+
+
+def _remote_branch_sha(
+    gh: Callable[[list[str]], tuple[int, str, str]],
+    plan: PushPlan,
+    *,
+    stage: str,
+) -> str | None:
+    args = [
+        "api", "--hostname", "github.com", "--method", "GET",
+        f"repos/{plan.repository}/git/ref/heads/{plan.branch}",
+    ]
+    try:
+        code, out, err = gh(args)
+    except (OSError, TypeError, ValueError) as exc:
+        raise blocked(f"REMOTE_REF_{stage.upper()}_FAILED: ref lookup could not run") from exc
+    if code:
+        if _is_unambiguous_missing_ref(code, out, err):
+            return None
+        evidence = sanitize_publication_evidence(err or out)
+        raise blocked(
+            f"REMOTE_REF_{stage.upper()}_FAILED: exit_status={code} "
+            f"response={evidence or '[empty]'}"
+        )
+    try:
+        value = json.loads(out)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise blocked(f"REMOTE_REF_{stage.upper()}_FAILED: malformed ref response") from exc
+    target = value.get("object") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or value.get("ref") != f"refs/heads/{plan.branch}"
+        or not isinstance(target, dict)
+        or target.get("type") != "commit"
+        or not re.fullmatch(r"[0-9a-f]{40}", str(target.get("sha", "")))
+    ):
+        raise blocked(f"REMOTE_REF_{stage.upper()}_FAILED: ref identity is unverifiable")
+    return target["sha"]
+
+
+def execute_checked_push(
+    git: Callable[[list[str]], tuple[int, str, str]],
+    gh: Callable[[list[str]], tuple[int, str, str]],
+    plan: PushPlan,
+    *,
+    gh_path: str,
+    credential_check: Callable[[str], None] = validate_gh_credential,
+) -> dict:
+    """Execute one authenticated checked push and verify its exact remote ref."""
+    gh_path = validate_gh_executable_path(gh_path)
+    expected_url = f"https://github.com/{plan.repository}.git"
+    if plan.url != expected_url:
+        raise blocked("CHECKED_HTTPS_REQUIRED: push URL is not the exact authorized HTTPS destination")
+    _preflight_push_identity_and_permission(gh, plan.repository)
+    credential_check(gh_path)
+    before = _remote_branch_sha(gh, plan, stage="preflight")
+    if before is not None:
+        if before != plan.sha:
+            raise blocked(
+                f"REMOTE_REF_CONFLICT: refs/heads/{plan.branch} points to {before}, not {plan.sha}"
+            )
+        return {
+            "repository": plan.repository,
+            "ref": f"refs/heads/{plan.branch}",
+            "sha": plan.sha,
+            "remote_url": plan.url,
+            "result": "already_present",
+            "write_performed": False,
+            "readback_verified": True,
+        }
+    code, _, err = git(plan.argv(gh_path))
+    if code:
+        evidence = sanitize_publication_evidence(err)
+        raise blocked(
+            f"GIT_PUSH_FAILED: exit_status={code} stderr={evidence or '[empty]'}"
+        )
+    after = _remote_branch_sha(gh, plan, stage="readback")
+    if after != plan.sha:
+        observed = after or "absent"
+        raise blocked(
+            f"REMOTE_REF_READBACK_MISMATCH: expected={plan.sha} observed={observed}"
+        )
+    return {
+        "repository": plan.repository,
+        "ref": f"refs/heads/{plan.branch}",
+        "sha": plan.sha,
+        "remote_url": plan.url,
+        "result": "pushed",
+        "write_performed": True,
+        "readback_verified": True,
+    }
 
 
 def _preflight_repository_and_workflow(
@@ -778,7 +1040,16 @@ def preflight_publication_plan(
     return PublicationPlan(push=push, pr_argv=pr_args, workflow=workflow)
 
 
-def main(argv=None, *, git=None, gh=None, ssh_config=None, sleep=time.sleep) -> int:
+def main(
+    argv=None,
+    *,
+    git=None,
+    gh=None,
+    gh_path=None,
+    credential_check=None,
+    ssh_config=None,
+    sleep=time.sleep,
+) -> int:
     """Validate or perform one checked branch, PR or workflow publication."""
     import argparse
 
@@ -807,25 +1078,25 @@ def main(argv=None, *, git=None, gh=None, ssh_config=None, sleep=time.sleep) -> 
         require_repository(repository, args.operation)
         if not args.push and not args.create_pr and not args.dispatch_workflow:
             return 0
+        checked_https_push = (
+            args.push
+            and repository == "PPiquemal/hermes-agent"
+            and args.operation == "checked_branch_push"
+        )
         gh_runner = gh
-        if gh_runner is None and (args.create_pr or args.dispatch_workflow or repository == "PPiquemal/rsip"):
-            from hermes_cli._subprocess_compat import noninteractive_git_env
-
-            def run_gh(command):
-                env = noninteractive_git_env()
-                env.pop("GH_REPO", None)
-                env["GH_HOST"] = "github.com"
-                env["GH_PROMPT_DISABLED"] = "1"
-                try:
-                    result = subprocess.run(
-                        ["gh", *command], capture_output=True, text=True,
-                        timeout=30, stdin=subprocess.DEVNULL, env=env,
-                    )
-                except (OSError, subprocess.SubprocessError):
-                    return 1, "", "gh invocation failed"
-                return result.returncode, result.stdout, result.stderr
-
-            gh_runner = run_gh
+        resolved_gh_path = gh_path
+        needs_gh = (
+            args.create_pr
+            or args.dispatch_workflow
+            or repository == "PPiquemal/rsip"
+            or checked_https_push
+        )
+        if needs_gh and resolved_gh_path is None and gh_runner is None:
+            resolved_gh_path = resolve_gh_executable()
+        if gh_runner is None and needs_gh:
+            if resolved_gh_path is None:
+                raise blocked("GH_CLI_UNAVAILABLE: checked gh executable is missing")
+            gh_runner = checked_gh_runner(resolved_gh_path)
         if args.create_pr:
             if args.operation != "checked_pr_create":
                 raise blocked("PR creation requires the checked_pr_create operation")
@@ -888,8 +1159,22 @@ def main(argv=None, *, git=None, gh=None, ssh_config=None, sleep=time.sleep) -> 
                 destination_branch=args.branch,
                 ssh_config=ssh_config,
             )
-        if git(plan.argv())[0]:
-            raise blocked("workflow push failed")
+        if checked_https_push:
+            if gh_runner is None or resolved_gh_path is None:
+                raise blocked("GH_CLI_UNAVAILABLE: checked HTTPS push cannot authenticate")
+            receipt = execute_checked_push(
+                git,
+                gh_runner,
+                plan,
+                gh_path=resolved_gh_path,
+                credential_check=credential_check or validate_gh_credential,
+            )
+            print(json.dumps(receipt, sort_keys=True))
+            return 0
+        code, _, err = git(plan.argv())
+        if code:
+            evidence = sanitize_publication_evidence(err)
+            raise blocked(f"GIT_PUSH_FAILED: exit_status={code} stderr={evidence or '[empty]'}")
         return 0
     except PublicationBlocked as exc:
         print(str(exc))

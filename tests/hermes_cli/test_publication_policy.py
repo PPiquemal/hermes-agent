@@ -60,7 +60,7 @@ def test_rsip_workflow_policy_drift_fails_closed(monkeypatch, key, value):
 @pytest.mark.parametrize("url", ["https://github.com/PPiquemal/hermes-agent.git", "git@github.com:PPiquemal/hermes-agent.git", "ssh://git@github.com/PPiquemal/hermes-agent"])
 def test_supported_urls_keep_the_selected_protocol(url):
     assert policy.require_push_url(
-        url, "PPiquemal/hermes-agent", "checked_branch_push"
+        url, "PPiquemal/hermes-agent", "hermes_branch"
     ) == url
 
 
@@ -133,31 +133,71 @@ def test_workflow_cli_blocks_wrong_repository_without_running_git(capsys):
 
 
 @pytest.mark.parametrize("failed", [False, True])
-def test_workflow_cli_explicit_push_is_single_attempt(failed, capsys):
+def test_workflow_cli_explicit_push_is_single_attempt(failed, capsys, monkeypatch):
     assert callable(getattr(policy, "main", None)), "workflow has no policy entry point"
+    monkeypatch.setattr(policy, "validate_gh_executable_path", lambda path: path)
     writes = []
+    sha = "a" * 40
+    gh_outputs = [
+        (0, json.dumps({"login": "PPiquemal"}), ""),
+        (0, json.dumps({
+            "full_name": "PPiquemal/hermes-agent",
+            "permissions": {"push": True},
+        }), ""),
+        (
+            1,
+            '{"message":"Not Found","status":"404"}',
+            "gh: Not Found (HTTP 404)",
+        ),
+    ]
+    if not failed:
+        gh_outputs.append((0, json.dumps({
+            "ref": "refs/heads/bot/js-autofix",
+            "object": {"type": "commit", "sha": sha},
+        }), ""))
+
+    def gh(args):
+        return gh_outputs.pop(0)
+
     def git(args):
         if "push" in args:
             writes.append(args)
-            return int(failed), "", ""
+            return int(failed), "", "push failed"
         outputs = {
             ("config", "--get-all", "remote.fork.pushurl"): (1, "", ""),
             ("config", "--get-all", "remote.fork.url"): (0, "https://github.com/PPiquemal/hermes-agent.git\n", ""),
             ("remote", "get-url", "--push", "--all", "fork"): (0, "https://github.com/PPiquemal/hermes-agent.git\n", ""),
             ("symbolic-ref", "--quiet", "--short", "HEAD"): (0, "main\n", ""),
-            ("rev-parse", "--verify", "refs/heads/main^{commit}"): (0, "a" * 40, ""),
+            ("rev-parse", "--verify", "refs/heads/main^{commit}"): (0, sha, ""),
         }
         if args[:2] == ["config", "--get-regexp"]:
             return 1, "", ""
         if args[0] == "check-ref-format":
             return 0, "", ""
         return outputs[tuple(args)]
-    result = policy.main(["--repository", "PPiquemal/hermes-agent", "--operation", "checked_branch_push", "--push", "--remote", "fork", "--branch", "bot/js-autofix"], git=git)
+
+    result = policy.main(
+        [
+            "--repository", "PPiquemal/hermes-agent",
+            "--operation", "checked_branch_push",
+            "--push", "--remote", "fork", "--branch", "bot/js-autofix",
+        ],
+        git=git,
+        gh=gh,
+        gh_path="/usr/bin/gh",
+        credential_check=lambda _: None,
+    )
     assert result == int(failed)
     assert len(writes) == 1
-    assert writes[0][-2:] == ["https://github.com/PPiquemal/hermes-agent.git", f"{'a' * 40}:refs/heads/bot/js-autofix"]
+    assert writes[0][-2:] == [
+        "https://github.com/PPiquemal/hermes-agent.git",
+        f"{sha}:refs/heads/bot/js-autofix",
+    ]
+    output = capsys.readouterr().out
     if failed:
-        assert "BLOCKED" in capsys.readouterr().out
+        assert "GIT_PUSH_FAILED" in output
+    else:
+        assert json.loads(output)["readback_verified"] is True
 
 
 @pytest.mark.parametrize("repository", ["PPiquemal/rsip", "github.com/PPiquemal/rsip"])
